@@ -5,9 +5,12 @@ from .pretrained import load_pretrained
 from .separate import load_track
 from .utils import apply_model, apply_model_vec
 
-
 # set device
 dev = 'cpu'
+
+WARMUP = 1
+ACTIVE = 1
+REPEAT = 1 
 
 # prepare input data
 def load_inp(in_file='test.mp3'):
@@ -16,15 +19,12 @@ def load_inp(in_file='test.mp3'):
     in_track = (in_track - ref.mean()) / ref.std()
     return in_track
 
+
 # load model
-model = load_pretrained('demucs_quantized')
-model.to(dev)
-
-# initialize profiler
-
-WARMUP = 1
-ACTIVE = 1
-REPEAT = 1 
+def load_model(s=False, s_t=False):
+    model = load_pretrained('demucs_quantized')
+    model.to(dev)
+    return model
 
 
 def profile_naive(in_track):
@@ -51,6 +51,17 @@ def profile_vec(in_track):
             sources = apply_model_vec(model, in_track, 8)
             prof.step()
 
+def profile_generic(inp, model, fn):
+    with torch.profiler.profile(
+        on_trace_ready=torch.profiler.tensorboard_trace_handler('./profile_log/'+fn),
+        record_shapes=True,
+        with_stack=True,
+        schedule=torch.profiler.schedule(wait=0, warmup=WARMUP, active=ACTIVE, repeat=REPEAT)
+    ) as prof:
+        for i in range((WARMUP + ACTIVE) * REPEAT):
+            sources = apply_model_vec(model, inp, 8)
+            prof.step()
+    return sources
 
 def compare_inp_lengths():
     from matplotlib import pyplot as plt
@@ -81,6 +92,14 @@ def compare_inp_lengths():
 
 if __name__ == "__main__":
     in_track = load_inp()
-    in_track = torch.hstack([in_track]*3)
-    profile_naive(in_track)
-    profile_vec(in_track)
+    in_track = torch.hstack([in_track]*9)
+    m1 = load_model()
+    m2 = load_model(True, False)
+    m3 = load_model(True, True)
+
+    o1 = profile_generic(in_track, m1, 'eager_bigbat')
+    o2 = profile_generic(in_track, m2, 's_bigbat')
+    o3 = profile_generic(in_track, m3, 's_t_bigbat')
+
+    assert torch.equal(o1, o2)
+    assert torch.equal(o2, o3)

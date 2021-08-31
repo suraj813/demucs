@@ -25,7 +25,7 @@ from torch import distributed
 from torch.nn import functional as F
 import time
 
-
+@torch.jit.ignore
 def center_trim(tensor, reference):
     """
     Center trim `tensor` with respect to `reference`, along the last dimension.
@@ -283,8 +283,7 @@ def apply_model_vec(model, mix, max_batch_sz=None, overlap=0.25, transition_powe
     
     mix.squeeze_(0)
     # print(f"Inference time: {inference_time} \nMerge time {merge_time} \nTotal time: {inference_time+merge_time}")
-    return stems, len(offsets)
-
+    return stems
 @contextmanager
 def temp_filenames(count, delete=True):
     names = []

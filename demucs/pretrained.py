@@ -48,6 +48,10 @@ def load_pretrained(name):
         return demucs(pretrained=True, extra=True)
     elif name == "demucs_quantized":
         return demucs(pretrained=True, quantized=True)
+    elif name == "demucs_quantized_scripted":
+        return demucs(pretrained=True, quantized=True, scripted=True)
+    elif name == "demucs_quantized_scripted_traced":
+        return demucs(pretrained=True, quantized=True, scripted=True, traced=True)
     elif name == "demucs_unittest":
         return demucs_unittest(pretrained=True)
     elif name == "tasnet":
@@ -73,10 +77,17 @@ def demucs_unittest(pretrained=True):
     return model
 
 
-def demucs(pretrained=True, extra=False, quantized=False, hq=False, channels=64):
+def demucs(pretrained=True, extra=False, quantized=False, hq=False, channels=64, scripted=False, traced=False):
     if not pretrained and (extra or quantized or hq):
         raise ValueError("if extra or quantized is True, pretrained must be True.")
-    model = Demucs(sources=SOURCES, channels=channels)
+    
+    if scripted:
+        from .model_ts import Demucs
+        model = Demucs(sources=SOURCES, channels=channels)
+    else:
+        from .model import Demucs
+        model = Demucs(sources=SOURCES, channels=channels)
+        
     if pretrained:
         name = 'demucs'
         if channels != 64:
@@ -92,6 +103,12 @@ def demucs(pretrained=True, extra=False, quantized=False, hq=False, channels=64)
         if hq:
             name += '_hq'
         _load_state(name, model, quantizer)
+
+    if scripted:
+        if traced:
+            model.lstm = torch.jit.trace(model.lstm, torch.rand(1, 2048, 10))
+        model = torch.jit.script(model)
+
     return model
 
 
