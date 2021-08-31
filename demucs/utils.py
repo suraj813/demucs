@@ -18,10 +18,12 @@ import zlib
 from contextlib import contextmanager
 
 from diffq import UniformQuantizer, DiffQuantizer
+import torch
 import torch as th
 import tqdm
 from torch import distributed
 from torch.nn import functional as F
+import time
 
 
 def center_trim(tensor, reference):
@@ -181,15 +183,26 @@ def apply_model(model, mix, shifts=None, split=False,
         # If the overlap < 50%, this will translate to linear transition when
         # transition_power is 1.
         weight = (weight / weight.max())**transition_power
+        inference_time = 0
+        merge_time = 0
         for offset in offsets:
             chunk = TensorChunk(mix, offset, segment)
+            
+            t0 = time.time()
             chunk_out = apply_model(model, chunk, shifts=shifts)
+            t1 = time.time()
+            inference_time += (t1 - t0)
+
+            t0 = time.time()
             chunk_length = chunk_out.shape[-1]
             out[..., offset:offset + segment] += weight[:chunk_length] * chunk_out
             sum_weight[offset:offset + segment] += weight[:chunk_length]
             offset += segment
+            t1 = time.time()
+            merge_time += (t1 - t0)
         assert sum_weight.min() > 0
         out /= sum_weight
+        # print(f"Inference time: {inference_time} | Merge time {merge_time}  | Total time: {inference_time+merge_time}")
         return out
     elif shifts:
         max_shift = int(0.5 * model.samplerate)
@@ -211,6 +224,66 @@ def apply_model(model, mix, shifts=None, split=False,
             out = model(padded_mix.unsqueeze(0))[0]
         return center_trim(out, length)
 
+
+def apply_model_vec(model, mix, max_batch_sz=None, overlap=0.25, transition_power=1.):
+    SEG_LEN = model.segment_length // 4
+    channels, total_length = mix.size()
+    device = mix.device
+    mix.unsqueeze_(0)
+
+
+    def merge_segments(out_segments, offsets):
+        out = torch.zeros(4, channels, total_length, device=device)
+        weight = torch.cat([torch.arange(1, SEG_LEN // 2 + 1), \
+            torch.arange(SEG_LEN - SEG_LEN // 2, 0, -1)]).to(device)
+        weight = (weight / weight.max())**transition_power
+        sum_weight = torch.zeros(total_length, device=device)
+        for i, out_seg in enumerate(out_segments):
+            offset = offsets[i]
+            end_ix = min(SEG_LEN, total_length - offset)
+            out[..., offset:offset + SEG_LEN] += (out_seg * weight)[..., :end_ix]
+            sum_weight[offset:offset + SEG_LEN] += weight[:end_ix]
+        out /= sum_weight
+        return out
+    
+
+    def _call_model(inp, length):
+        with torch.no_grad():
+            x = model(inp)
+            x = center_trim(x, length)
+        return x
+
+
+    def batch_infer(model, seg_list, out_length=None, batch_sz=None):
+        # if batch_sz and len(seg_list) > batch_sz:
+        chunked_input = torch.vstack(seg_list)
+        batched_input = torch.split(chunked_input, batch_sz) if batch_sz else (chunked_input, )
+        print("input sizes: ", [x.shape for x in batched_input])
+        chunked_output = torch.vstack([_call_model(inp, out_length) for inp in batched_input])
+        return chunked_output
+
+
+    seg_list = []
+    stride = int((1 - overlap) * SEG_LEN) 
+    offsets = range(0, total_length, stride)
+    valid_seg_len = model.valid_length(SEG_LEN)
+    
+    for offset in offsets:
+        seg =  TensorChunk(mix, offset, SEG_LEN).padded(valid_seg_len)
+        seg_list.append(seg)
+    
+    t0 = time.time()
+    model_out = batch_infer(model, seg_list, SEG_LEN, max_batch_sz)
+    t1 = time.time()
+    inference_time = (t1 - t0)
+    
+    stems = merge_segments(model_out, offsets)
+    t2 = time.time()
+    merge_time = (t2 - t1)
+    
+    mix.squeeze_(0)
+    # print(f"Inference time: {inference_time} \nMerge time {merge_time} \nTotal time: {inference_time+merge_time}")
+    return stems, len(offsets)
 
 @contextmanager
 def temp_filenames(count, delete=True):

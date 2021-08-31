@@ -11,6 +11,8 @@ from torch import nn
 
 from .utils import capture_init, center_trim
 
+import torch.autograd.profiler as profiler
+
 
 class BLSTM(nn.Module):
     def __init__(self, dim, layers=1):
@@ -180,23 +182,31 @@ class Demucs(nn.Module):
             std = 1
 
         x = (x - mean) / (1e-5 + std)
-
-        if self.resample:
-            x = julius.resample_frac(x, 1, 2)
+        
+        with profiler.record_function("SAMPLE0 PASS"):
+            if self.resample:
+                x = julius.resample_frac(x, 1, 2)
 
         saved = []
-        for encode in self.encoder:
-            x = encode(x)
-            saved.append(x)
-        if self.lstm:
-            x = self.lstm(x)
-        for decode in self.decoder:
-            skip = center_trim(saved.pop(-1), x)
-            x = x + skip
-            x = decode(x)
+        with profiler.record_function("ENCODER PASS"):
+            for encode in self.encoder:
+                x = encode(x)
+                saved.append(x)
+        
+        with profiler.record_function("LSTM PASS"):                
+            if self.lstm:
+                x = self.lstm(x)
 
-        if self.resample:
-            x = julius.resample_frac(x, 2, 1)
+        with profiler.record_function("DECODER PASS"):
+            for decode in self.decoder:
+                skip = center_trim(saved.pop(-1), x)
+                x = x + skip
+                x = decode(x)
+        
+        with profiler.record_function("SAMPLE1 PASS"):
+            if self.resample:
+                x = julius.resample_frac(x, 2, 1)
+
         x = x * std + mean
         x = x.view(x.size(0), len(self.sources), self.audio_channels, x.size(-1))
         return x
