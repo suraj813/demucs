@@ -123,6 +123,7 @@ class Demucs(nn.Module):
         if rescale:
             rescale_module(self, reference=rescale)
 
+    
     def valid_length(self, length):
         """
         Return the nearest valid length to use with the model so that

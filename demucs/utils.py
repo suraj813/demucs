@@ -255,10 +255,8 @@ def apply_model_vec(model, mix, max_batch_sz=None, overlap=0.25, transition_powe
 
 
     def batch_infer(model, seg_list, out_length=None, batch_sz=None):
-        # if batch_sz and len(seg_list) > batch_sz:
         chunked_input = torch.vstack(seg_list)
         batched_input = torch.split(chunked_input, batch_sz) if batch_sz else (chunked_input, )
-        print("input sizes: ", [x.shape for x in batched_input])
         chunked_output = torch.vstack([_call_model(inp, out_length) for inp in batched_input])
         return chunked_output
 
@@ -271,19 +269,13 @@ def apply_model_vec(model, mix, max_batch_sz=None, overlap=0.25, transition_powe
     for offset in offsets:
         seg =  TensorChunk(mix, offset, SEG_LEN).padded(valid_seg_len)
         seg_list.append(seg)
-    
-    t0 = time.time()
-    model_out = batch_infer(model, seg_list, SEG_LEN, max_batch_sz)
-    t1 = time.time()
-    inference_time = (t1 - t0)
-    
+
+    model_out = batch_infer(model, seg_list, SEG_LEN, max_batch_sz)    
     stems = merge_segments(model_out, offsets)
-    t2 = time.time()
-    merge_time = (t2 - t1)
-    
     mix.squeeze_(0)
-    # print(f"Inference time: {inference_time} \nMerge time {merge_time} \nTotal time: {inference_time+merge_time}")
     return stems
+
+
 @contextmanager
 def temp_filenames(count, delete=True):
     names = []
