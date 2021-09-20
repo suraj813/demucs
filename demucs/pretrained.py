@@ -10,7 +10,7 @@ import logging
 from diffq import DiffQuantizer
 import torch.hub
 
-from .model import Demucs
+from .model_ts import Demucs
 from .tasnet import ConvTasNet
 from .utils import set_state
 
@@ -104,10 +104,10 @@ def demucs(pretrained=True, extra=False, quantized=False, hq=False, channels=64,
             name += '_hq'
         _load_state(name, model, quantizer)
 
-    if scripted:
-        if traced:
-            model.lstm = torch.jit.trace(model.lstm, torch.rand(1, 2048, 10))
-        model = torch.jit.script(model)
+    # if scripted:
+    #     if traced:
+    #         model.lstm = torch.jit.trace(model.lstm, torch.rand(1, 2048, 10))
+    #     model = torch.jit.script(model)
 
     return model
 

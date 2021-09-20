@@ -14,3 +14,8 @@ Session.vim
 /metadata
 *.json
 *.mp3
+*.ogg
+*.pt
+*.ipynb
+*.onnx
+*DS_Store*

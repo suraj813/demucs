@@ -1,204 +1,170 @@
-import math
-import torch
-from torch import nn
-import julius
-from .utils import capture_init, center_trim
-from .model import *
-import time
+from .profiler import *
+from collections import OrderedDict
 
-
-class BLSTM(nn.Module):
-    def __init__(self, dim, layers=1):
-        super().__init__()
-        self.lstm = nn.LSTM(bidirectional=True, num_layers=layers, hidden_size=dim, input_size=dim)
-        self.linear = nn.Linear(2 * dim, dim)
-
+class QuantizedEncoder(nn.Module):
+    def __init__(self, fused_encoder_fp32):
+        super(QuantizedEncoder, self).__init__()
+        self.fused = copy.deepcopy(fused_encoder_fp32)
+        for seq in self.fused:
+            od = seq._modules
+            layers = list(od.values())
+            layers.insert(0, torch.quantization.QuantStub())
+            layers.insert(4, torch.quantization.DeQuantStub())
+            od2 = OrderedDict(zip([str(x) for x in range(len(layers))], layers))
+            seq._modules = od2
+        
     def forward(self, x):
-        x = x.permute(2, 0, 1)
-        x = self.lstm(x)[0]
-        x = self.linear(x)
-        x = x.permute(1, 2, 0)
+        for mod in self.fused:
+            x = mod(x)
         return x
 
-
-class Demucs(nn.Module):
-    @capture_init
-    def __init__(self,
-                 sources,
-                 audio_channels=2,
-                 channels=64,
-                 depth=6,
-                 rewrite=True,
-                 glu=True,
-                 rescale=0.1,
-                 resample=True,
-                 kernel_size=8,
-                 stride=4,
-                 growth=2.,
-                 lstm_layers=2,
-                 context=3,
-                 normalize=False,
-                 samplerate=44100,
-                 segment_length=4 * 10 * 44100):
-        """
-        Args:
-            sources (list[str]): list of source names
-            audio_channels (int): stereo or mono
-            channels (int): first convolution channels
-            depth (int): number of encoder/decoder layers
-            rewrite (bool): add 1x1 convolution to each encoder layer
-                and a convolution to each decoder layer.
-                For the decoder layer, `context` gives the kernel size.
-            glu (bool): use glu instead of ReLU
-            resample_input (bool): upsample x2 the input and downsample /2 the output.
-            rescale (int): rescale initial weights of convolutions
-                to get their standard deviation closer to `rescale`
-            kernel_size (int): kernel size for convolutions
-            stride (int): stride for convolutions
-            growth (float): multiply (resp divide) number of channels by that
-                for each layer of the encoder (resp decoder)
-            lstm_layers (int): number of lstm layers, 0 = no lstm
-            context (int): kernel size of the convolution in the
-                decoder before the transposed convolution. If > 1,
-                will provide some context from neighboring time
-                steps.
-            samplerate (int): stored as meta information for easing
-                future evaluations of the model.
-            segment_length (int): stored as meta information for easing
-                future evaluations of the model. Length of the segments on which
-                the model was trained.
-        """
-
-        super().__init__()
-        self.audio_channels = audio_channels
-        self.sources = sources
-        self.kernel_size = kernel_size
-        self.context = context
-        self.stride = stride
-        self.depth = depth
-        self.resample = resample
-        self.channels = channels
-        self.normalize = normalize
-        self.samplerate = samplerate
-        self.segment_length = segment_length
-        self.encoder = nn.ModuleList()
-        self.decoder = nn.ModuleList()
-
-        if glu:
-            activation = nn.GLU(dim=1)
-            ch_scale = 2
-        else:
-            activation = nn.ReLU()
-            ch_scale = 1
-
-        in_channels = audio_channels
-        for index in range(depth):
-            encode = []
-            encode += [nn.Conv1d(in_channels, channels, kernel_size, stride), nn.ReLU()]
-            if rewrite:
-                encode += [nn.Conv1d(channels, ch_scale * channels, 1), activation]
-            self.encoder.append(nn.Sequential(*encode))
-
-            decode = []
-            if index > 0:
-                out_channels = in_channels
-            else:
-                out_channels = len(self.sources) * audio_channels
-            if rewrite:
-                decode += [nn.Conv1d(channels, ch_scale * channels, context), activation]
-            decode += [nn.ConvTranspose1d(channels, out_channels, kernel_size, stride)]
-            if index > 0:
-                decode.append(nn.ReLU())
-            self.decoder.insert(0, nn.Sequential(*decode))
-            in_channels = channels
-            channels = int(growth * channels)
-
-        channels = in_channels
-
-        if lstm_layers:
-            self.lstm = BLSTM(channels, lstm_layers)  
-        else:
-            self.lstm = None
-
-        if rescale:
-            rescale_module(self, reference=rescale)
-
-    @torch.jit.ignore
-    def valid_length(self, length):
-        """
-        Return the nearest valid length to use with the model so that
-        there is no time steps left over in a convolutions, e.g. for all
-        layers, size of the input - kernel_size % stride = 0.
-
-        If the mixture has a valid length, the estimated sources
-        will have exactly the same length when context = 1. If context > 1,
-        the two signals can be center trimmed to match.
-
-        For training, extracts should have a valid length.For evaluation
-        on full tracks we recommend passing `pad = True` to :method:`forward`.
-        """
-        if self.resample:
-            length *= 2
-        for _ in range(self.depth):
-            length = math.ceil((length - self.kernel_size) / self.stride) + 1
-            length = max(1, length)
-            length += self.context - 1
-        for _ in range(self.depth):
-            length = (length - 1) * self.stride + self.kernel_size
-
-        if self.resample:
-            length = math.ceil(length / 2)
-        return int(length)
-
-    @torch.jit.ignore
-    def resample_frac(self, x, d1: int, d2: int):  ## --  DESPITE IGNORE, IT STILL NEEDS TYPE ANNOTATIONS
-        return julius.resample_frac(x, d1, d2)
-
-    def forward(self, mix):
-        x = mix
-        mean = 0
-        std = 1
-
-        x = (x - mean) / (1e-5 + std)
+class QuantizedDecoder(nn.Module):
+    def __init__(self, decoder_fp32):
+        super(QuantizedDecoder, self).__init__()
+        self.fused = copy.deepcopy(decoder_fp32)
+        for seq in self.fused:
+            od = seq._modules
+            layers = list(od.values())
+            layers.insert(0, torch.quantization.QuantStub())
+            layers.insert(2, torch.quantization.DeQuantStub())
+            layers.insert(4, torch.quantization.QuantStub())
+            layers.insert(6, torch.quantization.DeQuantStub())
+            od2 = OrderedDict(zip([str(x) for x in range(len(layers))], layers))
+            seq._modules = od2
         
-        # Resample
-        if self.resample:
-            x = self.resample_frac(x, 1, 2)
-
-        # Encoder
-        saved = []
-        for encode in self.encoder:
-            x = encode(x)
-            saved.append(x)
-        
-        # LSTM
-        x = self.lstm(x)
-
-        # Decoder
-        for decode in self.decoder:
-            skip = center_trim(saved.pop(-1), x)
-            x = x + skip
-            x = decode(x)
-        
-        # Resample
-        if self.resample:
-            x = self.resample_frac(x, 2, 1)
-
-        x = x * std + mean
-        x = x.view(x.size(0), len(self.sources), self.audio_channels, x.size(-1))
-        return x
-
-
-class QuantizedDemucs(Demucs):
-    def __init__(self, demucs_fp32):
-        super(QuantizedDemucs, self).__init__(sources=demucs_fp32.sources)
-        self.demucs_fp32 = demucs_fp32
-        self.quant_ip = torch.quantization.QuantStub()
-        self.dequant_op = torch.quantization.DeQuantStub()
-    
     def forward(self, x):
-        x = self.quant_ip(x)
-        x = self.demucs_fp32(x)
-        x = self.dequant_op(x)
+        for mod in self.fused:
+            x = mod(x)
         return x
 
+
+def fuse_encoder(enc):
+    enc.eval()
+    for mod in enc.modules():
+        if type(mod) == torch.nn.Sequential:
+            torch.quantization.fuse_modules(mod, ['0','1'], inplace=True)
+    return enc
+
+
+def prep_encoder(fused_enc):
+    qe = QuantizedEncoder(fused_enc)
+    qe.qconfig = torch.quantization.default_qconfig
+    qe = torch.quantization.prepare(qe)
+    return qe.fused
+
+def prep_decoder(decoder):
+    qd = QuantizedDecoder(decoder)
+    qd.qconfig = torch.quantization.default_qconfig
+    qd = torch.quantization.prepare(qd)
+    return qd.fused
+
+def convert_quant(qmodel, calibrate_inp=None):
+    if calibrate_inp is not None:
+        _ = apply_model_vec(qmodel, calibrate_inp, 8) 
+    torch.quantization.convert(qmodel.encoder, inplace=True)
+    torch.quantization.convert(qmodel.decoder, inplace=True)
+
+def prep_quant_pipeline(model, dyn=False, decoder=False, calibrate_inp=None):
+    fused_enc = fuse_encoder(model.encoder)
+    model.encoder = prep_encoder(fused_enc)
+    if decoder:
+        model.decoder = prep_decoder(model.decoder)
+    convert_quant(model, calibrate_inp)
+    if dyn:
+        torch.quantization.quantize_dynamic(
+            model, {nn.LSTM, nn.Linear, nn.Conv1d}, dtype=torch.qint8, inplace=True
+        )
+    return model
+
+def load_quantized_model_from_disk(pkl, dyn=False, decoder=False):
+    model = Demucs([1,1,1,1])
+    model = prep_quant_pipeline(model, dyn, decoder)
+    model.load_state_dict(torch.load(pkl))
+    return model
+
+
+def main():
+    MODEL = load_demucs_model()
+    inp, ref = load_inp('original.ogg')
+
+    dynq =  torch.quantization.quantize_dynamic(
+            MODEL, {nn.LSTM, nn.Linear, nn.Conv1d}, dtype=torch.qint8
+        )
+
+    qencoder = copy.deepcopy(MODEL)
+    fused_enc = fuse_encoder(qencoder.encoder)
+    qencoder.encoder = prep_encoder(fused_enc)
+    convert_quant(qencoder, inp)
+    dyn_qencoder = torch.quantization.quantize_dynamic(
+            qencoder, {nn.LSTM, nn.Linear, nn.Conv1d}, dtype=torch.qint8
+        ) # dynamic mapping doesn't have conv1d yet there is a minor speedup by including it
+
+    q_encdec = copy.deepcopy(MODEL)
+    fused_enc = fuse_encoder(q_encdec.encoder)
+    q_encdec.encoder = prep_encoder(fused_enc)
+    q_encdec.decoder = prep_decoder(q_encdec.decoder)
+    convert_quant(q_encdec, inp)
+    dyn_q_encdec = torch.quantization.quantize_dynamic(
+            q_encdec, {nn.LSTM, nn.Linear, nn.Conv1d}, dtype=torch.qint8
+        ) # dynamic mapping doesn't have conv1d yet there is a minor speedup by including it
+
+
+    names = ['MODEL', 'dynq', 'qencoder', 'dyn_qencoder', 'q_encdec', 'dyn_q_encdec']
+    models = [MODEL, dynq, qencoder, dyn_qencoder, q_encdec, dyn_q_encdec]
+    for name, mod in zip(names,models):
+        print(f"Model: {name}")
+        print(f"Size: {print_size_of_model(mod)}")
+        print(f"Latency on 1s sample: {module_latency(mod)}")
+        t0 = time.time()
+        sources = apply_model_vec(mod, inp, 8)
+        elapsed = time.time() - t0
+        print(f"Latency on 7m song: {elapsed}")
+        encode(sources, ref, folder=f'quantized_outputs/{name}')
+        print(f"Audio output folder: quantized_outputs/{name}")
+        torch.save(mod.state_dict(), f'quantized_outputs/{name}.pt')
+        print(f"Model saved to: quantized_outputs/{name}.pt")
+
+
+
+# Model: MODEL
+# Size (MB): 1062.738911
+# Latency on 1s sample: 0.6736747026443481
+# Latency on 7m song: 221.8002438545227
+# Audio output folder: quantized_outputs/MODEL
+# Model saved to: quantized_outputs/MODEL.pt
+
+# Model: dynq
+# Size (MB): 534.258841
+# Latency on 1s sample: 0.3377014875411987
+# Latency on 7m song: 153.23943495750427
+# Audio output folder: quantized_outputs/dynq
+# Model saved to: quantized_outputs/dynq.pt
+
+# Model: qencoder
+# Size (MB): 962.157493
+# Latency on 1s sample: 0.6052535057067872
+# Latency on 7m song: 191.35514116287231
+# Audio output folder: quantized_outputs/qencoder
+# Model saved to: quantized_outputs/qencoder.pt
+
+# Model: dyn_qencoder
+# Size (MB): 433.677233
+# Latency on 1s sample: 0.2500915050506592
+# Latency on 7m song: 113.88189005851746
+# Audio output folder: quantized_outputs/dyn_qencoder
+# Model saved to: quantized_outputs/dyn_qencoder.pt
+
+# Model: q_encdec
+# Size (MB): 794.478037
+# Latency on 1s sample: 0.46161298751831054
+# Latency on 7m song: 148.61190700531006
+# Audio output folder: quantized_outputs/q_encdec
+# Model saved to: quantized_outputs/q_encdec.pt
+
+# Model: dyn_q_encdec
+# Size (MB): 265.997777
+# Size: None
+# Latency on 1s sample: 0.12788548469543456
+# Latency on 7m song: 77.12007713317871
+# Audio output folder: quantized_outputs/dyn_q_encdec
+# Model saved to: quantized_outputs/dyn_q_encdec.pt

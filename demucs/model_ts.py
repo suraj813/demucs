@@ -6,7 +6,13 @@ from .utils import capture_init, center_trim
 from .model import *
 import time
 
+"""
+- Replace all numpy with torch
+- Replace all .data with .detach().item()
+- use latest opset=13
 
+
+"""
 class BLSTM(nn.Module):
     def __init__(self, dim, layers=1):
         super().__init__()

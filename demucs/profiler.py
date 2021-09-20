@@ -5,15 +5,9 @@ import torch.profiler
 from .pretrained import load_pretrained
 from .separate import load_track
 from .utils import apply_model, apply_model_vec
-from .quantize import QuantizedDemucs
 import subprocess, os, copy
 
-# set device
 dev = 'cpu'
-
-WARMUP = 1
-ACTIVE = 1
-REPEAT = 1 
 
 # prepare input data
 def load_inp(in_file='test.mp3'):
@@ -22,17 +16,20 @@ def load_inp(in_file='test.mp3'):
     in_track = (in_track - ref.mean()) / ref.std()
     return in_track, ref
 
-
 # load model
-def load_model(s=False, t=False):
+def load_demucs_model(s=False, t=False):
     name = "demucs_quantized"
     if s:
         name += "_scripted"
     if t:
         name += "_traced"
     model = load_pretrained(name)
-    model.to(dev)
     return model
+
+def wallclock(mdl, inp):
+    t0 = time.time()
+    _ = apply_model_vec(mdl, inp)
+    return time.time()-t0
 
 
 def profile(inp, model, fn):
@@ -138,6 +135,8 @@ def profile_dyn_quantized():
     in_track = torch.hstack([in_track]*3)
     
     m = load_model()
+    # available modules for dyn quant
+    # https://github.com/pytorch/pytorch/blob/master/torch/quantization/quantization_mappings.py
     qm = torch.quantization.quantize_dynamic(
         m, {nn.LSTM, nn.Linear, nn.Conv1d}, dtype=torch.qint8
     )
@@ -147,50 +146,3 @@ def profile_dyn_quantized():
 
     o4 = profile(in_track, qm, 'd_quant')
     encode(o4, ref, 'd_quant', 'mp3')
-
-def get_fused():
-    m = load_model()        # Load pretrained model
-    fused_m = copy.deepcopy(m)
-    
-    m.eval()                # Switch to eval
-    fused_m.eval()
-
-    # Layer fusion -- currently we can only fuse conv+relu in the encoder
-    for mod in fused_m.encoder.modules():
-        if type(mod) == torch.nn.Sequential:
-            torch.quantization.fuse_modules(mod, ['0', '1'], inplace=True)
-
-    # Verify if encoder layer fusion is correct
-    # print(fused_m.encoder)
-    assert module_equivalence(
-        nn.Sequential(*fused_m.encoder), nn.Sequential(*m.encoder)
-    )
-    return m, fused_m
-
-
-def get_quant(fused_m):
-    # Apply stubs to the input and output. \
-    # This collects quantization statistics for inputs and outputs. \
-    # By default, pytorch only does this for weights (and activations?)
-    qm = QuantizedDemucs(fused_m)
-
-     # Init quant config
-    # qm.qconfig = torch.quantization.get_default_qconfig("fbgemm")
-    qm.qconfig = torch.quantization.default_qconfig
-    torch.quantization.prepare(qm, inplace=True)
-
-    # calibrate
-    inp, ref = load_inp()  # pass representative data!
-    src = apply_model_vec(qm, inp) 
-    encode(src, ref, 'quant', 'mp3')
-
-    # Convert calibrated fp32 to qint model
-    torch.quantization.convert(qm, inplace=True)
-    print_size_of_model(qm)
-    return qm
-
-
-if __name__ == "__main__":
-    m, fused = get_fused()
-    qm = get_quant(fused)
-    print(qm)
