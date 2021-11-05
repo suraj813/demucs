@@ -39,6 +39,7 @@ class QuantizedDecoder(nn.Module):
 
 
 def fuse_encoder(enc):
+    """Fuses conv and relu models in the encoder sequential module"""
     enc.eval()
     for mod in enc.modules():
         if type(mod) == torch.nn.Sequential:
@@ -46,34 +47,40 @@ def fuse_encoder(enc):
     return enc
 
 
-def prep_encoder(fused_enc):
+def prepare_encoder(fused_enc):
+    """Inserts quant/dequant stubs by hand because not all modules 
+    in the encoder are eligible for quantization"""
     qe = QuantizedEncoder(fused_enc)
     qe.qconfig = torch.quantization.default_qconfig
     qe = torch.quantization.prepare(qe)
     return qe.fused
 
 def prep_decoder(decoder):
+    """Inserts quant/dequant stubs by hand because not all modules 
+    in the decoder are eligible for quantization"""
     qd = QuantizedDecoder(decoder)
     qd.qconfig = torch.quantization.default_qconfig
     qd = torch.quantization.prepare(qd)
     return qd.fused
 
-def convert_quant(qmodel, calibrate_inp=None):
-    if calibrate_inp is not None:
-        _ = apply_model_vec(qmodel, calibrate_inp, 8) 
+def convert_quant(qmodel, calibration_input=None):
+    """Calibrate the model by passing a `calibration_input` for the observer modules.
+    Convert submodules to the quantized version."""
+    if calibration_input is not None:
+        _ = apply_model_vec(qmodel, calibration_input, 8) 
     torch.quantization.convert(qmodel.encoder, inplace=True)
     torch.quantization.convert(qmodel.decoder, inplace=True)
 
 def prep_quant_pipeline(model, dyn=False, decoder=False, calibrate_inp=None):
+    """1. Fuse encoder 
+    2. Prepare encoder 
+    3. Prepare decoder (decoder doesn't have fusables)
+    4. Convert modules to QuantizedModules"""
     fused_enc = fuse_encoder(model.encoder)
-    model.encoder = prep_encoder(fused_enc)
+    model.encoder = prepare_encoder(fused_enc)
     if decoder:
         model.decoder = prep_decoder(model.decoder)
     convert_quant(model, calibrate_inp)
-    if dyn:
-        torch.quantization.quantize_dynamic(
-            model, {nn.LSTM, nn.Linear, nn.Conv1d}, dtype=torch.qint8, inplace=True
-        )
     return model
 
 def load_quantized_model_from_disk(pkl, dyn=False, decoder=False):
@@ -93,7 +100,7 @@ def main():
 
     qencoder = copy.deepcopy(MODEL)
     fused_enc = fuse_encoder(qencoder.encoder)
-    qencoder.encoder = prep_encoder(fused_enc)
+    qencoder.encoder = prepare_encoder(fused_enc)
     convert_quant(qencoder, inp)
     dyn_qencoder = torch.quantization.quantize_dynamic(
             qencoder, {nn.LSTM, nn.Linear, nn.Conv1d}, dtype=torch.qint8
@@ -101,7 +108,7 @@ def main():
 
     q_encdec = copy.deepcopy(MODEL)
     fused_enc = fuse_encoder(q_encdec.encoder)
-    q_encdec.encoder = prep_encoder(fused_enc)
+    q_encdec.encoder = prepare_encoder(fused_enc)
     q_encdec.decoder = prep_decoder(q_encdec.decoder)
     convert_quant(q_encdec, inp)
     dyn_q_encdec = torch.quantization.quantize_dynamic(
