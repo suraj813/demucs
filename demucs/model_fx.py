@@ -1,18 +1,26 @@
 import math
+import julius
 import torch
 from torch import nn
-import julius
-from .utils import capture_init, center_trim
-from .model import *
-import time
+import io, zlib
+from utils import capture_init, center_trim
 
-"""
-- Replace all numpy with torch
-- Replace all .data with .detach().item()
-- use latest opset=13
+from torch.fx import wrap
+wrap('center_trim')
+
+def rescale_module(module, reference):
+    def rescale_conv(conv, reference):
+        std = conv.weight.std().detach()
+        scale = (std / reference)**0.5
+        conv.weight.data /= scale
+        if conv.bias is not None:
+            conv.bias.data /= scale
+
+    for sub in module.modules():
+        if isinstance(sub, (nn.Conv1d, nn.ConvTranspose1d)):
+            rescale_conv(sub, reference)
 
 
-"""
 class BLSTM(nn.Module):
     def __init__(self, dim, layers=1):
         super().__init__()
@@ -24,6 +32,14 @@ class BLSTM(nn.Module):
         x = self.lstm(x)[0]
         x = self.linear(x)
         x = x.permute(1, 2, 0)
+        return x
+
+
+class ResampleNonTraceable(nn.Module):
+    """Module to wrap (non-traceable) third-party pythonlib calls"""
+    def forward(self, x, d1: int, d2: int, active: bool):  
+        if active:
+            return julius.resample_frac(x, d1, d2)
         return x
 
 
@@ -118,18 +134,16 @@ class Demucs(nn.Module):
             self.decoder.insert(0, nn.Sequential(*decode))
             in_channels = channels
             channels = int(growth * channels)
-
         channels = in_channels
 
-        if lstm_layers:
-            self.lstm = BLSTM(channels, lstm_layers)  ## Use traced BLSTM?
-        else:
-            self.lstm = None
+        self.lstm = BLSTM(channels, lstm_layers)
 
         if rescale:
             rescale_module(self, reference=rescale)
 
-    
+        self.non_traceable_resample = ResampleNonTraceable()
+
+
     def valid_length(self, length):
         """
         Return the nearest valid length to use with the model so that
@@ -156,121 +170,51 @@ class Demucs(nn.Module):
             length = math.ceil(length / 2)
         return int(length)
 
-    @torch.jit.ignore
-    def resample_frac(self, x, d1: int, d2: int):  ## --  DESPITE IGNORE, IT STILL NEEDS TYPE ANNOTATIONS
-        return julius.resample_frac(x, d1, d2)
 
-    def forward(self, mix):
-        x = mix
-
-        # if self.normalize: -- COMMENTING THIS OUT BECAUSE BY DEFAULT THIS IS FALSE
-        #     mono = mix.mean(dim=1, keepdim=True)
-        #     mean = mono.mean(dim=-1, keepdim=True)
-        #     std = mono.std(dim=-1, keepdim=True)
-        # else:
+    def forward(self, x):
         mean = 0
         std = 1
-
         x = (x - mean) / (1e-5 + std)
-        
-        with profiler.record_function("SAMPLE0 PASS"):
-            if self.resample:
-                # x = julius.resample_frac(x, 1, 2) -- 3RD PARTY MODULE CANNOT SCRIPT
-                x = self.resample_frac(x, 1, 2)
+        x = self.non_traceable_resample(x, 1, 2, self.resample)
 
+        # Encoder Pass
         saved = []
-        with profiler.record_function("ENCODER PASS"):
-            for encode in self.encoder:
-                x = encode(x)
-                saved.append(x)
+        for encode in self.encoder:
+            x = encode(x)
+            saved.append(x)
         
-        with profiler.record_function("LSTM PASS"):                
-            # if self.lstm:  -- WE DON'T NEED CONTROL FLOW HERE, WE KNOW OUR MODEL HAS LSTM
-            x = self.lstm(x)
+        # LSTM Pass
+        x = self.lstm(x)
 
-        with profiler.record_function("DECODER PASS"):
-            for decode in self.decoder:
-                skip = center_trim(saved.pop(-1), x)
-                x = x + skip
-                x = decode(x)
+        # Decoder Pass
+        for decode in self.decoder:
+            skip = center_trim(saved.pop(-1), x) # Align skip-connection size with decoder input
+            x = x + skip
+            x = decode(x)
         
-        with profiler.record_function("SAMPLE1 PASS"):
-            if self.resample:
-                # x = julius.resample_frac(x, 2, 1)
-                x = self.resample_frac(x, 2, 1)
-
+        x = self.non_traceable_resample(x, 2, 1, self.resample)
         x = x * std + mean
         x = x.view(x.size(0), len(self.sources), self.audio_channels, x.size(-1))
         return x
 
 
-def get_scripted_demucs():
-    demucs = Demucs([1,1,1,1])
-    scripted_demucs = torch.jit.script(demucs)
-    return scripted_demucs
+def load_model(is_quantized=False):
+    model = Demucs([1,1,1,1])
+    if is_quantized:
+        from diffq import DiffQuantizer
+        model_weights_url = "https://dl.fbaipublicfiles.com/demucs/v3.0/demucs_quantized-07afea75.th"
+    else:
+        model_weights_url = "https://dl.fbaipublicfiles.com/demucs/v3.0/demucs-e07c671f.th"
 
-def get_traced_lstm(lstm):
-    # lstm = BLSTM(2048, 2)
-    x = torch.rand(1, 2048, 10)
-    traced_lstm = torch.jit.trace(lstm, x)
-    return traced_lstm
+    state = torch.hub.load_state_dict_from_url(model_weights_url, map_location='cpu', check_hash=True)
 
-def test_blstm_tracing():
-    traced_lstm = get_traced_lstm()
-    assert torch.equal(lstm(x), traced_lstm(x))
-    traced_lstm(torch.rand(4, 2048, 20))
-    return True
-
-def bench_lstm_trace():
-    x = torch.rand(10,2048,100)
-    lstm = BLSTM(2048, 2)
-    t_lstm = get_traced_lstm(lstm)
-    t_lstm(x)
-
-    t0 = time.time()
-    eager_out = lstm(x)
-    print("Eager: ", time.time()-t0)
-
-    t0 = time.time()
-    traced_out = t_lstm(x)
-    print("Traced: ", time.time()-t0)
-    
-    assert torch.equal(eager_out, traced_out)
-
-def test_demucs_scripting():
-    x = torch.rand(1,2,44100)
-    demucs = Demucs([1,1,1,1])
-    scripted_demucs = get_scripted_demucs()
-    assert torch.equal(demucs(x), scripted_demucs(x))
-    demucs(torch.rand(4, 2, 88200))
-
-
-def bench_tracing_scripting():
-    x = torch.rand(10,2,441000)
-    
-    demucs = Demucs([1,1,1,1])
-    
-    with torch.inference_mode():
-        t0 = time.time()
-        eager_out = demucs(x)
-        print("Eager: ", time.time()-t0)
-
-        traced_demucs = demucs
-        traced_demucs.lstm = get_traced_lstm(demucs.lstm)
-        traced_demucs(torch.rand(1,2,44100))
-        t0 = time.time()
-        traced_out = traced_demucs(x)
-        print("Traced: ", time.time()-t0)
-        assert torch.equal(eager_out, traced_out)
-
-        scripted_demucs = torch.jit.script(traced_demucs)
-        scripted_demucs(torch.rand(1,2,44100))
-        t0 = time.time()
-        scripted_out = scripted_demucs(x)
-        print("Script+Trace: ", time.time()-t0)
-        assert torch.equal(eager_out, scripted_out)
-        
-        scripted_demucs(torch.rand(4, 2, 88200))
-
-if __name__ == "__main__":
-    bench_tracing_scripting()
+    if is_quantized:
+        quantizer = DiffQuantizer(model, group_size=8, min_size=1)
+        buf = io.BytesIO(zlib.decompress(state["compressed"]))
+        state = torch.load(buf, "cpu")
+        quantizer.restore_quantized_state(state)
+        quantizer.detach() 
+    else:
+        model.load_state_dict(state)
+    model.eval()
+    return model

@@ -1,5 +1,6 @@
 from .profiler import *
 from collections import OrderedDict
+import copy
 
 class QuantizedEncoder(nn.Module):
     def __init__(self, fused_encoder_fp32):
