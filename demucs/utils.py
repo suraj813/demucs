@@ -24,8 +24,9 @@ import tqdm
 from torch import distributed
 from torch.nn import functional as F
 import time
+from torch.fx import wrap
 
-@torch.jit.ignore
+# @wrap
 def center_trim(tensor, reference):
     """
     Center trim `tensor` with respect to `reference`, along the last dimension.
@@ -35,9 +36,7 @@ def center_trim(tensor, reference):
     if hasattr(reference, "size"):
         reference = reference.size(-1)
     delta = tensor.size(-1) - reference
-    if delta < 0:
-        raise ValueError("tensor must be larger than reference. " f"Delta is {delta}.")
-    if delta:
+    if delta > 0:
         tensor = tensor[..., delta // 2:-(delta - delta // 2)]
     return tensor
 
@@ -225,57 +224,6 @@ def apply_model(model, mix, shifts=None, split=False,
         return center_trim(out, length)
 
 
-def apply_model_vec(model, mix, max_batch_sz=None, overlap=0.25, transition_power=1.):
-    SEG_LEN = model.segment_length // 4
-    channels, total_length = mix.size()
-    device = mix.device
-    mix.unsqueeze_(0)
-
-
-    def merge_segments(out_segments, offsets):
-        out = torch.zeros(4, channels, total_length, device=device)
-        weight = torch.cat([torch.arange(1, SEG_LEN // 2 + 1), \
-            torch.arange(SEG_LEN - SEG_LEN // 2, 0, -1)]).to(device)
-        weight = (weight / weight.max())**transition_power
-        sum_weight = torch.zeros(total_length, device=device)
-        for i, out_seg in enumerate(out_segments):
-            offset = offsets[i]
-            end_ix = min(SEG_LEN, total_length - offset)
-            out[..., offset:offset + SEG_LEN] += (out_seg * weight)[..., :end_ix]
-            sum_weight[offset:offset + SEG_LEN] += weight[:end_ix]
-        out /= sum_weight
-        return out
-    
-
-    def _call_model(inp, length):
-        with torch.no_grad():
-            x = model(inp)
-            x = center_trim(x, length)
-        return x
-
-
-    def batch_infer(model, seg_list, out_length=None, batch_sz=None):
-        chunked_input = torch.vstack(seg_list)
-        batched_input = torch.split(chunked_input, batch_sz) if batch_sz else (chunked_input, )
-        chunked_output = torch.vstack([_call_model(inp, out_length) for inp in batched_input])
-        return chunked_output
-
-
-    seg_list = []
-    stride = int((1 - overlap) * SEG_LEN) 
-    offsets = range(0, total_length, stride)
-    valid_seg_len = model.valid_length(SEG_LEN)
-    
-    for offset in offsets:
-        seg =  TensorChunk(mix, offset, SEG_LEN).padded(valid_seg_len)
-        seg_list.append(seg)
-
-    model_out = batch_infer(model, seg_list, SEG_LEN, max_batch_sz)    
-    stems = merge_segments(model_out, offsets)
-    mix.squeeze_(0)
-    return stems
-
-
 @contextmanager
 def temp_filenames(count, delete=True):
     names = []
@@ -385,3 +333,50 @@ def capture_init(init):
         init(self, *args, **kwargs)
 
     return __init__
+
+def vectorized_apply(model, mix, max_batch_sz=8, overlap=0.25, transition_power=1.):
+    SEG_LEN = model.segment_length // 4  # To square-ify the input tensor
+    channels, total_length = mix.size()
+    device = mix.device
+    mix.unsqueeze_(0)
+
+    def merge_segments(out_segments, offsets):
+        out = torch.zeros(4, channels, total_length, device=device)
+        weight = torch.cat([torch.arange(1, SEG_LEN // 2 + 1), \
+            torch.arange(SEG_LEN - SEG_LEN // 2, 0, -1)]).to(device)
+        weight = (weight / weight.max())**transition_power
+        sum_weight = torch.zeros(total_length, device=device)
+        for i, out_seg in enumerate(out_segments):
+            offset = offsets[i]
+            end_ix = min(SEG_LEN, total_length - offset)
+            out[..., offset:offset + SEG_LEN] += (out_seg * weight)[..., :end_ix]
+            sum_weight[offset:offset + SEG_LEN] += weight[:end_ix]
+        out /= sum_weight
+        return out
+
+    def _call_model(inp, length):
+        with torch.no_grad(), torch.cuda.amp.autocast():  
+            x = model(inp)
+            x = center_trim(x, length)
+        return x
+
+    def batch_infer(model, seg_list, out_length=None, batch_sz=None):
+        chunked_input = torch.vstack(seg_list)
+        batched_input = torch.split(chunked_input, batch_sz) if batch_sz else (chunked_input, )
+        chunked_output = torch.vstack([_call_model(inp, out_length) for inp in batched_input])
+        return chunked_output
+
+
+    seg_list = []
+    stride = int((1 - overlap) * SEG_LEN) 
+    offsets = range(0, total_length, stride)
+    valid_seg_len = model.valid_length(SEG_LEN)
+    
+    for offset in offsets:
+        seg =  TensorChunk(mix, offset, SEG_LEN).padded(valid_seg_len)
+        seg_list.append(seg)
+
+    model_out = batch_infer(model, seg_list, SEG_LEN, max_batch_sz)    
+    stems = merge_segments(model_out, offsets)
+    mix.squeeze_(0)
+    return stems

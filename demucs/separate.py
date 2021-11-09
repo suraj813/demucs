@@ -13,7 +13,7 @@ import julius
 import torch as th
 import torchaudio as ta
 
-from .audio import AudioFile, convert_audio_channels
+from audio import AudioFile, convert_audio_channels
 from .pretrained import is_pretrained, load_pretrained
 from .utils import apply_model, load_model
 

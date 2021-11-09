@@ -11,7 +11,7 @@ import julius
 import numpy as np
 import torch
 
-from .utils import temp_filenames
+from utils import temp_filenames
 
 
 def _read_info(path):
